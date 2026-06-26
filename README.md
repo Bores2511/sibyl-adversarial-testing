@@ -91,8 +91,27 @@ test_server_endpoints.sh   — api enumeration
 deep_audit_findings.md     — detailed audit notes
 ```
 
+## fixes
+
+included patches that address the two main findings:
+
+**fix_fail_open_ceiling.py** — lowers `FAIL_OPEN_CEILING_MULT` from 4 to 2 in `_capcheck.py`. this reduces the offline cap from 8MB to 4MB on a 2MB free tier. still preserves durability during transient outages but limits the abuse window.
+
+**fix_429_fail_open.py** — removes 429 from `RETRYABLE_HTTP_CODES` into a separate `RATE_LIMIT_HTTP_CODES` set. after retry budget exhausted for 429, raises `TierAuthError` (hard-deny) instead of falling through to `TierVerificationError` (fail-open eligible). 429 means "slow down", not "i'm unreachable".
+
+both patches are idempotent and can be run against the installed package directly:
+```
+python3 patches/fix_fail_open_ceiling.py
+python3 patches/fix_429_fail_open.py
+```
+
+verified after patching:
+```
+FAIL_OPEN_CEILING_MULT = 2
+RETRYABLE_HTTP_CODES = frozenset({408, 425, 500, 502, 503, 504})
+RATE_LIMIT_HTTP_CODES = frozenset({429})
+```
+
 ## overall assessment
 
-the codebase is well hardened — you can see multiple audit rounds already applied (KAPPA, SEC, CAP, CORE, MH series). most injection/bypass/dos vectors are closed. the remaining issues are capacity-abuse edge cases that require intentional network manipulation to exploit.
-
-if i had to grade it: A-. the only real gap is the fail-open behavior being too permissive when the server is unreachable.
+the codebase is well hardened — you can see multiple audit rounds already applied (KAPPA, SEC, CAP, CORE, MH series). most injection/bypass/dos vectors are closed. the capacity-abuse edge cases are now addressed with the included patches.
