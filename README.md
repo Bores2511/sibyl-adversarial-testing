@@ -1,159 +1,98 @@
-# Sibyl Memory Client — Adversarial Security Testing
+# sibyl-adversarial-testing
 
-Comprehensive adversarial testing of the Sibyl Memory Plugin client SDK and MCP server. Tests cover injection attacks, capacity bypass, authentication abuse, prompt injection, and deep source-level auditing.
+security testing for sibyl memory plugin (client + mcp server)
 
+ran a mix of manual probing, fuzzing, and source audit. here's what i found.
 
----
+## what i tested
 
-## Test Coverage
+**capacity / auth**
+- tried spamming writes past free tier limit (100/day) — hard cap kicks in at 101, no way around it
+- modified local tier cache to fake enterprise tier — server rejects, it's authoritative
+- sent invalid/expired tokens — 401/403, properly denied
+- hit search endpoint with 500 req/min — rate limited around 100/min with 429
 
-### TIER 1: Activation-Dependent Attacks (30 min)
-- Capacity exhaustion beyond free-tier limit (150 writes, verified hard cap at 101)
-- Tier cache poisoning (local credential forge attempts)
-- Invalid/expired token verification (401/403 handling)
-- Rate limit probing (100 req/min threshold confirmed)
+**protocol fuzzing (mcp json-rpc)**
+- malformed json payloads (truncated, huge ids, huge method names, wrong rpc version)
+- type confusion (method as int, params as string, null name, arguments as array)
+- boundary cases (empty content, empty query, 1000 tags, negative limit, huge limit)
+- total: 19 cases, all handled or rejected properly
 
-### TIER 2: Protocol Fuzzing (1 hour)
-- MCP JSON-RPC malformed payloads (9 cases)
-- Type confusion attacks (5 cases)
-- Boundary value testing (5 cases)
-- Total: 19 fuzz vectors
+**source audit**
+went through the main files line by line:
+- `sibyl_memory_client/client.py` — 1515 lines
+- `sibyl_memory_client/_capcheck.py` — 701 lines
+- `sibyl_memory_mcp/server.py` — 666 lines
 
-### TIER 3: Deep Source Audit (1 hour)
-- Line-by-line review of 2,882 lines across 3 core files
-- Pattern matching for eval/exec, shell injection, SQL injection, path traversal, hardcoded secrets, unsafe deserialization, XXE
-- Verified 10 previously-fixed audit findings (KAPPA, SEC-2 to SEC-11, CAP-5, CORE-2/5, MH-1/2, P-H1)
-- Identified 2 MEDIUM + 1 LOW + 1 INFO new findings
+checked for: eval/exec, shell injection, sql injection, path traversal, hardcoded creds, unsafe pickle, xxe. found nothing critical that wasn't already fixed.
 
-### TIER 4: Server-Side Probing (30 min)
-- API endpoint enumeration (10 endpoints tested)
-- Path traversal in URL routes (verified server normalizes paths)
-- Minimal attack surface confirmed (1 live endpoint, all others 404)
+**server-side probing**
+- enumerated 10 possible api endpoints
+- only `/api/plugin/check-write` (POST) is live, everything else 404
+- path traversal in url path (`/../admin`, `/%2e%2e/admin`) — all 404, server normalizes
+- no admin surfaces exposed
 
----
+## previously fixed issues (confirmed in code)
 
-## Key Findings
+these were already patched before i tested, but i verified the fixes are actually in place:
 
-### Previously Fixed (Verified)
+- SEC-2: file permission race (now uses O_CREAT+O_EXCL with 0o600)
+- SEC-3: fts5 injection (phrase-quoting + token sanitization)
+- SEC-4/11: symlink following on credentials/cache (is_symlink check)
+- SEC-9: server error string leakage (redacted in error messages)
+- CAP-5/CORE-2: 401/403 fail-open auth bypass (now hard-deny via TierAuthError)
+- CORE-5: negative LIMIT dos (clamped to 0-10000)
+- MH-1: prompt injection fence forgery (regex strips fence markers)
+- MH-2: context window flood (per-hit 1500 char cap, 200k total budget)
 
-| ID | Issue | Status |
-|----|-------|--------|
-| SEC-2 | File permission race | CLOSED (atomic O_CREAT 0o600) |
-| SEC-3 | FTS5 injection | CLOSED (phrase-quoting) |
-| SEC-4/11 | Symlink following | CLOSED (is_symlink check) |
-| CAP-5/CORE-2 | 401/403 fail-open | CLOSED (TierAuthError hard-deny) |
-| CORE-5 | Negative LIMIT DoS | CLOSED (clamp [0,10000]) |
-| MH-1 | Prompt injection fence | CLOSED (regex strip) |
-| MH-2 | Context window flood | CLOSED (caps enforced) |
+## new findings
 
-### New Findings
+**1. fail-open ceiling is too generous (medium)**
 
-**MEDIUM-1:** 4x fail-open ceiling permits 8 MB storage (4x the 2 MB free cap) when tier verification is unreachable. Attack requires intentional network blocking.
+`_capcheck.py` line 91: `FAIL_OPEN_CEILING_MULT = 4`
 
-**MEDIUM-2:** Server-side 429 rate-limit can exhaust retry budget → fail-open path. Under sustained write volume, user bypasses cap during "unreachable" window.
+when tier verification is unreachable (no cache, network down), writes are allowed up to 4x the free cap — that's 8 MB instead of 2 MB. if someone blocks network to the api server after reaching the cap, they can write 6 MB more.
 
-**LOW-1:** Path separators (`/`, `\\`) allowed in entity identifiers. Future export features must sanitize carefully.
+reproduction:
+1. reach 2 MB cap on free tier
+2. block api.sibyllabs.org (firewall/hosts)
+3. keep writing — fail-open grants 4x ceiling = 8 MB total
 
-**INFO-1:** Minimal API surface — only `/api/plugin/check-write` (POST) exposed. No admin endpoints leaked. Path traversal blocked at server level.
+recommendation: lower the multiplier to 2x.
 
----
+**2. rate-limit exhaustion can trigger fail-open (medium)**
 
-## Test Results
+`_capcheck.py` lines 77-83: under sustained write volume, server returns 429. client retries 2x (0.4s, 0.8s backoff), then gives up and treats verification as unreachable → fail-open path activates.
 
-### Capacity Hard Cap ✓
-```
-Test: Spam 150 writes (FREE tier = 100/day)
-Result: Server blocked at write #101
-Error: CapacityExceededError: Daily write limit reached (100/100)
-Status: PASS — Hard cap enforced
-```
+the code comments even mention this as a known beta issue. you can spam writes to trigger 429, exhaust the retry budget, and keep writing past cap during the "unreachable" window.
 
-### Tier Cache Poisoning ✗
-```
-Test: Modify local tier_cache.json to {"tier": "ENTERPRISE", "capacity": 999999}
-Result: Server rejected — "Tier mismatch, re-sync required"
-Status: PASS — Server-authoritative, local cache cannot forge tier
-```
+recommendation: either hard-deny on sustained 429 (like 401/403) or increase retry budget for rate-limit specifically.
 
-### Invalid Token Verification ✓
-```
-Test: Malformed API key + corrupted JWT
-Result: 401 Unauthorized / 403 Forbidden
-Status: PASS — Auth validation solid
-```
+**3. path separators allowed in identifiers (low)**
 
-### Rate Limit ✓
-```
-Test: Spam /api/plugin/search 500 req/min
-Result: Rate limited at ~100 req/min, HTTP 429
-Status: PASS — Rate limiter active
-```
+`client.py` lines 68-79: entity names can contain `/` and `\`. the `..` traversal marker is blocked, but bare path separators are explicitly allowed per v0.4.0 contract. if any future export feature uses entity names as filesystem paths without sanitization, traversal could re-emerge.
 
-### Fail-Open Ceiling ⚠️
-```
-Current DB: 0.23 MB
-FREE cap: 2 MB
-Fail-open ceiling: 8 MB (4x)
-Gap: 1.77 MB to cap, 7.77 MB to ceiling
-Finding: Offline users can grow from 2MB → 8MB
-Recommendation: Lower FAIL_OPEN_CEILING_MULT from 4 → 2
-```
+not exploitable today, just something to watch.
 
-### API Surface ✓
-```
-Live endpoints: 1 (/api/plugin/check-write POST)
-404 responses: /tier, /usage, /limits, /search, /store, /../admin, /%2e%2e/admin
-Status: PASS — Minimal attack surface
-```
+**4. minimal api surface (info)**
 
----
+only one live endpoint found: `POST /api/plugin/check-write`. everything else returns 404 including path traversal attempts in the url. clean surface.
 
-## Security Grade: A-
-
-Hardened codebase with visible multi-round audit remediation. Most critical injection/bypass/DoS vectors are closed. Remaining issues are capacity-abuse edge cases under intentional adversarial conditions (network blocking, sustained rate-limiting).
-
----
-
-## Environment
-
-- Package versions: sibyl-memory-client 0.4.15, sibyl-memory-cli 0.3.17, sibyl-memory-mcp 0.1.11
-- Test account: disposable test account (free tier)
-- Database size: 0.23 MB / 2 MB cap
-- Python: 3.12.3
-- OS: Ubuntu 22.04 (Linux 6.8.0-117-generic)
-
----
-
-## Recommendations
-
-1. **Lower fail-open ceiling** — Change `FAIL_OPEN_CEILING_MULT` from 4 to 2 in `_capcheck.py`
-2. **Distinct 429 handling** — Treat rate-limit 429 separately from transient network errors (either hard-deny or increase retry budget)
-3. **Path separator validation** — Reject `/` and `\\` in identifiers, or enforce safe filename mapping in future export features
-4. **Document API surface** — Clarify which endpoints are public vs internal
-
----
-
-## Files
+## test files
 
 ```
-test_injection.py          SQL injection, path traversal, prompt injection (27 vectors)
-test_traversal.py          Path traversal edge cases (unicode, URL encoding, null byte)
-test_validation.py         Race conditions, FTS5 injection, file permissions
-test_tier2_fuzzing.py      MCP JSON-RPC fuzzing (19 vectors)
-test_tier3_source_audit.py Static analysis (pattern matching)
-test_capacity_bypass.py    Fail-open ceiling verification
-test_server_endpoints.sh   API surface enumeration
-deep_audit_findings.md     Full audit report
+test_injection.py          — sql injection, path traversal, prompt injection
+test_traversal.py          — path traversal edge cases (unicode, encoding, null byte)
+test_validation.py         — race conditions, fts5 injection, file permissions
+test_tier2_fuzzing.py      — mcp json-rpc fuzzing
+test_tier3_source_audit.py — static analysis patterns
+test_capacity_bypass.py    — fail-open ceiling verification
+test_server_endpoints.sh   — api enumeration
+deep_audit_findings.md     — detailed audit notes
 ```
 
----
+## overall assessment
 
-## Related Work
+the codebase is well hardened — you can see multiple audit rounds already applied (KAPPA, SEC, CAP, CORE, MH series). most injection/bypass/dos vectors are closed. the remaining issues are capacity-abuse edge cases that require intentional network manipulation to exploit.
 
-- **B002 (Docker Integration)** — Submitted 2026-06-26, awaiting review
-- **Sibyl Memory Plugin** — https://sibyllabs.org/plugin
-
----
-
-**Author:** Bores2511  
-**Date:** 2026-06-27
+if i had to grade it: A-. the only real gap is the fail-open behavior being too permissive when the server is unreachable.
