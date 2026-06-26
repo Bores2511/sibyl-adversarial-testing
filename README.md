@@ -117,7 +117,7 @@ Hardened codebase with visible multi-round audit remediation. Most critical inje
 ## Environment
 
 - Package versions: sibyl-memory-client 0.4.15, sibyl-memory-cli 0.3.17, sibyl-memory-mcp 0.1.11
-- Test account: disposable-test-account (free tier)
+- Test account: disposable test account (free tier)
 - Database size: 0.23 MB / 2 MB cap
 - Python: 3.12.3
 - OS: Ubuntu 22.04 (Linux 6.8.0-117-generic)
