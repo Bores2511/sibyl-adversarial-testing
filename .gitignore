@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.db
+*.db-wal
+*.db-shm
+.env
+credentials.json
+tier_cache.json
+test_results/*.log
